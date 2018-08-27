@@ -11,7 +11,7 @@
  * Copyright (C) 2011 by Ryan Cramer
  * Licensed under GNU/GPL v2.
  * http://www.processwire.com
- * @version 1.0.5
+ * @version 1.0.9
  * @since 1.0.1
  *      - added permission to reverse restriction set by this module
  *      - minor changes to prevent endless redirects, limitation of selectable redirect pages
@@ -28,6 +28,12 @@
  *      - bugfix remove restriction for specified branches (add/edit) according to the Process instead of page IDs
  * @since 1.0.6
  *      - bugfix ProcessPageAdd check $input->get->parent_id AND $input->post->parent_id as well
+ * @since 1.0.7
+ *      - bugfix landingPage settings - trim page id before applying to selector
+ * @since 1.0.8
+ *      - changed on single restrictedRole to array of $restrictedRoles
+ * @since 1.0.9
+ *      - bugfix: hookPageViewable() let ProcessWire check access of the page beeing edited
  */
 
 class AdminHidePageTreeByRole extends Process implements Module, ConfigurableModule {
@@ -37,7 +43,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 			'title'    => 'Admin Hide Page Tree by Role',
 			'summary'  => 'Hides the page tree from users who have certain role(s).',
 			'author'   => 'kixe',
-			'version'  => 106,
+			'version'  => 109,
 			'href'     => 'https://processwire.com/talk/topic/6142-hide-page-tree-in-the-admin/#entry60087',
 			'singular' => true,
 			'autoload' => true,
@@ -48,7 +54,8 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 	}
 
     protected $landingPage = 2;
-    protected $restrictedRole = null;
+    protected $restrictedUserRoles = array();    
+    protected $editableBranches = array();
 
     static public function getDefaultData() {
         return array(
@@ -67,9 +74,10 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
     public function init() {
 
         foreach ($this->restrictedRoles as $r) {
-            if ($this->user->hasRole($r)) $this->restrictedRole = $r;
+            if ($this->wire('user')->id && $this->wire('user')->hasRole($r)) $this->restrictedUserRoles[] = $r;
         }
-        if (!$this->restrictedRole) return;
+        if (empty($this->restrictedUserRoles)) return;
+        $this->editableBranches = $this->setEditableBranches($this->restrictedUserRoles);
 
         $landingPagesArray = array();
         if ($this->landingPages) {
@@ -77,18 +85,26 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
             foreach ($landingPages as $line) {
                 list($key,$value) = array_pad(explode(":", $line), 2, null);
                 if($value) {
-                    if (!$this->wire('pages')->get($value)->viewable()) continue;
+                    if (!$this->wire('pages')->get(trim($value))->viewable()) continue;
                     $landingPagesArray[trim($key)] = trim($value);
                 }
             }
         }
-        if (isset($landingPagesArray[$this->restrictedRole])) $this->landingPage = $landingPagesArray[$this->restrictedRole];
+        // if user has multiple restricted roles and this role multiple landing pages assigned, we take the first match
+        foreach ($this->restrictedUserRoles as $restrictedRole) {
+            if (!isset($landingPagesArray[$restrictedRole])) continue;
+            $this->landingPage = $landingPagesArray[$restrictedRole];
+            break;
+        }
 
-        if ($this->user->isLoggedin() && !$this->user->hasPermission('admin-restrict-page-tree-reverse')) {
+        if ($this->wire('user')->isLoggedin() && !$this->wire('user')->hasPermission('admin-hide-page-tree-reverse')) {
             $this->addHookBefore('ProcessHome::execute', $this, 'hookBeforeProcessHome');
             $this->addHookAfter('Page::viewable', $this, 'hookPageViewable');
 
-            /*
+            /**
+             * @deprecated
+             * we manage everything via Page::viewable
+             *
             $this->addHookBefore('ProcessPageList::execute', $this, 'noPermission');
             $this->addHookBefore('ProcessList::execute', $this, 'noPermission');
             $this->addHookBefore('ProcessModule::execute', $this, 'noPermission');
@@ -144,14 +160,17 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
             return;
         }
 
-        // disallow pages like having no process assigned
+        // let ProcessWire check access of the page beeing edited
+        if (wire('input')->get->id == $event->object->id) return;
+
+        // disallow pages having no process assigned
         if (empty($event->object->process)) {
             $event->return = false;
             return;
         }
 
         // allow edit for pages living under a specified tree, allow page add under a specified parent
-        // excepted from restriction by role ($this->editablePages)
+        // excepted from restriction by role ($this->editablePage
         // template or field based edit/add permission required
         $allowedProcesses = array('ProcessPageAdd', 'ProcessPageEdit', 'ProcessPageEditImageSelect', 'ProcessPageEditLink');
         if ($this->editablePages && in_array($event->object->process, $allowedProcesses)) {
@@ -159,7 +178,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
             if ($event->object->process == 'ProcessPageEdit' && wire('config')->ajax) return;
             if ($event->object->process == 'ProcessPageAdd') $id = isset(wire('input')->get->parent_id)? (int) wire('input')->get->parent_id : (int) wire('input')->post->parent_id;
             else $id = (int) wire('input')->get->id;
-            if ($this->isEditableBranch($this->restrictedRole, $id, true)) return;
+            if ($this->isEditableBranch($id, true)) return;
             $event->return = false;
         }
 
@@ -174,25 +193,57 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
         return;
     }
 
-    protected function ___isEditableBranch($role, $id, $includeParent = false) {
+    /**
+     * check if the branch is allowed for edits or adds?
+     *
+     * @param id page (edit)/ parent id (add)
+     * @param addPageToParentsArray bool
+     * @return bool
+     */
+    protected function isEditableBranch($id, $addPageToParentsArray = false) {
         // quick exit
-        if (!$this->wire('pages')->get($id)->editable() && !$this->wire('pages')->get($id)->addable()) return false;
+        // if (!$this->wire('pages')->get($id)->editable()) return false; // DO WE NEED THIS ???
+        if (empty($this->editableBranches)) return false;
+        // get family tree of the page to check
         $parentsArray = $this->wire('pages')->get($id)->parents->each('id');
-        if ($includeParent) $parentsArray[] = $id;
-        $editablePagesArray = explode("\n", $this->editablePages);
-        foreach ($editablePagesArray as $line) {
-            list($key,$value) = array_pad(explode(":", $line), 2, null);
-            if ($key != $role || $value === null) continue;
-            $value = explode(",", $value);
-            if (empty($value)) continue;
-            foreach ($value as $allowedID) {
-                $allowedID = (int) trim($allowedID);
-                if (in_array($allowedID, $parentsArray)) return true;
-            }
-        }
+        // add page itself
+        if ($addPageToParentsArray) $parentsArray[] = $id;
+        foreach ($this->editableBranches as $allowedParentID) {
+            if (in_array($allowedParentID, $parentsArray)) return true;
+         }
         return false;
     }
 
+    /**
+     * create array of page IDs of editable/ addable branches (parent ids) assigned to a specific role
+     *
+     * @param $roles array of role ids
+     * @return array
+     * @todo hookable? does not work! why? (:autoload module)
+     */
+    protected function ___setEditableBranches($roles) {
+        if (!$this->editablePages) return array();
+        $editableBranches = array();
+        $editablePagesArray = explode("\n", $this->editablePages);
+        if (empty($editablePagesArray)) return array();
+        foreach ($editablePagesArray as $line) {
+            list($key,$value) = array_pad(explode(":", $line), 2, null);
+            if (!in_array($key, $roles) || $value === null) continue;
+            $value = explode(",", $value);
+            if (empty($value)) continue;
+            foreach ($value as $pageID) {
+                $pageID = (int) trim($pageID);
+                $editableBranches[] = $pageID;
+            }
+        }
+        return $editableBranches;   
+    }
+
+    /**
+     * hook for anollowed processes
+     * currently not in use
+     * @deprecated
+     *
     public function noPermission(HookEvent $event) {
         foreach ($this->restrictedRoles as $r) {
             if ($this->user->hasRole($r)) {
@@ -201,6 +252,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
             }
         }
     }
+    */
 
     static public function getModuleConfigInputfields(array $data) {
         $data = array_merge(self::getDefaultData(), $data);
@@ -210,7 +262,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
         $role_list = self::makeOptions(wire('roles'));
 		$f = $modules->get("InputfieldAsmSelect");
 		$f->name = "restrictedRoles";
-		$f->label =  __("Roles that will have the pages tree, SETUP, MODAL and ACCESS area hidden from them");
+		$f->label =  __("Roles that will have the pages tree, SETUP, MODULES and ACCESS area hidden from them");
         $f->notes = __("Access allowed to custom admin pages, PROFILE, /page/edit/ and /page/add/ for pages as specified below.");
         $f->options = $role_list;
         $f->value = $data['restrictedRoles'];
