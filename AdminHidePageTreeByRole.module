@@ -1,4 +1,4 @@
-<?php
+<?php namespace ProcessWire;
 
 /**
  * ProcessWire Module AdminHidePageTreeByRole
@@ -11,7 +11,7 @@
  * Copyright (C) 2011 by Ryan Cramer
  * Licensed under GNU/GPL v2.
  * http://www.processwire.com
- * @version 1.0.9
+ * @version 1.1.1
  * @since 1.0.1
  *      - added permission to reverse restriction set by this module
  *      - minor changes to prevent endless redirects, limitation of selectable redirect pages
@@ -34,6 +34,10 @@
  *      - changed on single restrictedRole to array of $restrictedRoles
  * @since 1.0.9
  *      - bugfix: hookPageViewable() let ProcessWire check access of the page beeing edited
+ * @since 1.1.0
+ *      - added hook ProcessLogin::afterLoginOutput to provide a logout button
+ * @since 1.1.1 
+ *      - added option to pull body content of home from other page, set in module settings
  */
 
 class AdminHidePageTreeByRole extends Process implements Module, ConfigurableModule {
@@ -43,7 +47,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 			'title'    => 'Admin Hide Page Tree by Role',
 			'summary'  => 'Hides the page tree from users who have certain role(s).',
 			'author'   => 'kixe',
-			'version'  => 109,
+			'version'  => 111,
 			'href'     => 'https://processwire.com/talk/topic/6142-hide-page-tree-in-the-admin/#entry60087',
 			'singular' => true,
 			'autoload' => true,
@@ -54,14 +58,17 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 	}
 
     protected $landingPage = 2;
-    protected $restrictedUserRoles = array();    
+
+    protected $restrictedUserRoles = array(); 
+
     protected $editableBranches = array();
 
     static public function getDefaultData() {
         return array(
             'restrictedRoles' => array(),
             'landingPages' => null,
-            'editablePages' => null
+            'editablePages' => null,
+            'adminPageBody' => null
         );
     }
 
@@ -72,6 +79,8 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
     }
 
     public function init() {
+
+        $this->addHookAfter('ProcessLogin::afterLoginOutput', $this, 'hookAfterLoginOutput');
 
         foreach ($this->restrictedRoles as $r) {
             if ($this->wire('user')->id && $this->wire('user')->hasRole($r)) $this->restrictedUserRoles[] = $r;
@@ -90,7 +99,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
                 }
             }
         }
-        // if user has multiple restricted roles and this role multiple landing pages assigned, we take the first match
+        // If a user has multiple restricted roles and therefore multiple landing pages assigned, we take the first match
         foreach ($this->restrictedUserRoles as $restrictedRole) {
             if (!isset($landingPagesArray[$restrictedRole])) continue;
             $this->landingPage = $landingPagesArray[$restrictedRole];
@@ -100,42 +109,69 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
         if ($this->wire('user')->isLoggedin() && !$this->wire('user')->hasPermission('admin-hide-page-tree-reverse')) {
             $this->addHookBefore('ProcessHome::execute', $this, 'hookBeforeProcessHome');
             $this->addHookAfter('Page::viewable', $this, 'hookPageViewable');
-
-            /**
-             * @deprecated
-             * we manage everything via Page::viewable
-             *
-            $this->addHookBefore('ProcessPageList::execute', $this, 'noPermission');
-            $this->addHookBefore('ProcessList::execute', $this, 'noPermission');
-            $this->addHookBefore('ProcessModule::execute', $this, 'noPermission');
-            $this->addHookBefore('ProcessPageSort::execute', $this, 'noPermission');
-            $this->addHookBefore('ProcessPageTrash::execute', $this, 'noPermission');
-            $this->addHookBefore('ProcessPageSearch::execute', $this, 'noPermission');
-            $id = $this->wire('input')->get->id;
-            if ($id && !$this->wire('pages')->get((int)$id)->editable()) {
-                // allow for editable pages within modal
-                $this->addHookBefore('ProcessPageEditLink::execute', $this, 'noPermission');
-                $this->addHookBefore('ProcessPageEditImageSelect::execute', $this, 'noPermission');
-            }
-            $this->addHookBefore('ProcessPageLister::execute', $this, 'noPermission');
-            $this->addHookBefore('ProcessRecentPages::execute', $this, 'noPermission');
-            */
         }
     }
 
     /**
-     * Welcome message for loggedin users
+     * BeforeHook in ProcessHome::execute()
+     * Show welcome message (body field)
+     * replace headline and body content from other page if set in module settings
+     * render default message if body is not set
+     * @param $event object HookEvent
+     *
      */
-    public function hookBeforeProcessHome(HookEvent $event) {    
+    protected function hookBeforeProcessHome(HookEvent $event) {
         $event->replace = true;
-        $event->return = wire('input')->wb? "<h2>".sprintf($this->_('Hi %s, welcome back!'),strtoupper(wire('user')->get('title|name')))."</h2>": $this->_('You are logged in. Use the main menu to navigate');
+        $page = $this->adminPageBody? wire('pages')->get($this->adminPageBody) : $event->object->getProcessPage();
+        wire('page')->set('body', null);
+        if ($page->body) {
+            $page->of(true);
+            $event->return = $page->body;
+            if ($page->title) {
+                $event->object->headline($page->title);
+                $event->object->browserTitle($page->title);
+            }
+        } else {
+            $event->return = wire('input')->wb? "<h2>".sprintf($this->_('Hi %s, welcome back!'), $this->getUserLabel($this->wire('user')))."</h2>" : // new line to make translatable
+            "<p>".$this->_("You are logged in. Use the main menu to navigate.")."<p>";
+        }
     }
 
     /**
-     * Hook in Page::viewable()
-     * max allowed: /admin/profile/ and other custom trees under /admin/
+     * get user label if different from name
+     * @uses AdminThemeUikit
+     * @param $user object User
+     * @return string
+     *
      */
-    public function hookPageViewable(HookEvent $event) {
+    public function getUserLabel(User $user) {
+        if (!$this->wire('modules')->isInstalled('AdminThemeUikit') || !$this->wire('user')->admin_theme == 'AdminThemeUikit') return $user->name;
+        $userLabel = $this->wire('modules')->get('AdminThemeUikit')->userLabel;
+        $userLabel = wirePopulateStringTags($userLabel, $user);
+        return $userLabel;
+    }
+
+    /**
+     * AfterHook in ProcessLogin::afterLoginOutput() which renders the output that appears
+     * if there is nowhere to redirect to after login.
+     * 
+     * We add a Logout button for cases like this from here.
+     * @param $event object HookEvent
+     *
+     */
+    public function hookAfterLoginOutput(HookEvent $event) {
+        $btn = $this->wire('modules')->get('InputfieldButton');
+        $btn->value = $this->_('Logout');
+        $btn->href = $this->config->urls->admin . 'login/logout/';
+        $event->return .= "<p>" . $btn->render() . "</p>";
+    }
+
+    /**
+     * AfterHook in Page::viewable()
+     * max allowed: /admin/profile/ and other custom trees under /admin/
+     * @param $event object HookEvent
+     */
+    protected function hookPageViewable(HookEvent $event) {
 
         // process page search ('page-edit' permission)
         // if ($event->object->id == 300) return;
@@ -165,7 +201,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 
         // disallow pages having no process assigned
         if (empty($event->object->process)) {
-            $event->return = false;
+            // $event->return = false;
             return;
         }
 
@@ -199,6 +235,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
      * @param id page (edit)/ parent id (add)
      * @param addPageToParentsArray bool
      * @return bool
+     *
      */
     protected function isEditableBranch($id, $addPageToParentsArray = false) {
         // quick exit
@@ -239,22 +276,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
         return $editableBranches;   
     }
 
-    /**
-     * hook for anollowed processes
-     * currently not in use
-     * @deprecated
-     *
-    public function noPermission(HookEvent $event) {
-        foreach ($this->restrictedRoles as $r) {
-            if ($this->user->hasRole($r)) {
-                $event->replace = true;
-                $event->return = "<h2>".$this->_("You do not have permission to access this area.")."</h2>";               
-            }
-        }
-    }
-    */
-
-    static public function getModuleConfigInputfields(array $data) {
+    public static function getModuleConfigInputfields(array $data) {
         $data = array_merge(self::getDefaultData(), $data);
 		$fields = new InputfieldWrapper();
 		$modules = wire('modules');
@@ -262,8 +284,8 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
         $role_list = self::makeOptions(wire('roles'));
 		$f = $modules->get("InputfieldAsmSelect");
 		$f->name = "restrictedRoles";
-		$f->label =  __("Roles that will have the pages tree, SETUP, MODULES and ACCESS area hidden from them");
-        $f->notes = __("Access allowed to custom admin pages, PROFILE, /page/edit/ and /page/add/ for pages as specified below.");
+		$f->label =  __("Roles that will have the pages tree, SETUP, MODULES and ACCESS area hidden from them.");
+        $f->notes = __("Access allowed to custom admin pages and PROFILE if permission is granted. You may want to revoke restriction using process /page/edit/ and /page/add/ for pages and trees as specified below.");
         $f->options = $role_list;
         $f->value = $data['restrictedRoles'];
 		$fields->add($f);
@@ -272,7 +294,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 		$f->name = "landingPages";
 		$f->label =  __("Page to redirect restricted users after login");
         $f->description =  __("Assign a page ID to role in the format 'role-name: pageID'. One per line if multiple.");
-        $f->notes = __("No redirect if user is not permitted to view assigned page. Default landing page is admin root (id=2)");
+        $f->notes = __("No redirect if user is not permitted to view assigned page. If a user has multiple restricted roles and therefore multiple landing pages assigned, we take the first match. Default landing page is admin root (id=2)");
         $f->value = $data['landingPages'];
         $fields->add($f);
 
@@ -284,13 +306,22 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
         $f->value = $data['editablePages'];
         $fields->add($f);
 
+        $page_list = self::makeOptions(wire('pages')->find("body!='',include=all"), 'url');
+        $f = $modules->get("InputfieldSelect");
+        $f->name = "adminPageBody";
+        $f->label =  __("Page from which 'home' content should be retrieved");
+        $f->description =  __("If a user is not permitted to see the page tree, a welcome message is displayed by default on the admin home page (id=2). You may want to select a page to drag alternative content out of the body field that is rendered instead.");
+        $f->options = $page_list;
+        $f->value = $data['adminPageBody'];
+        $fields->add($f);
+
         return $fields;
 	}
 
-    static public function makeOptions($wireArray) {
+    public static function makeOptions($wireArray, $property = 'title|name') {
         $options = array();
         foreach ($wireArray as $f) {
-            $label = $f->get('title|name');
+            $label = $f->get($property);
             $key  = $f->name;
             $options[$key] = $label;
         }
