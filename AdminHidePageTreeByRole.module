@@ -11,7 +11,9 @@
  * Copyright (C) 2011 by Ryan Cramer
  * Licensed under GNU/GPL v2.
  * http://www.processwire.com
- * @version 1.1.1
+ * 
+ * @version 1.1.2
+ * 
  * @since 1.0.1
  *      - added permission to reverse restriction set by this module
  *      - minor changes to prevent endless redirects, limitation of selectable redirect pages
@@ -38,6 +40,8 @@
  *      - added hook ProcessLogin::afterLoginOutput to provide a logout button
  * @since 1.1.1 
  *      - added option to pull body content of home from other page, set in module settings
+ * @since 1.1.2 
+ *      - fixed bug handling of action link button clicks (ajax requests) called from ProcessPageLister 2023-06-27
  */
 
 class AdminHidePageTreeByRole extends Process implements Module, ConfigurableModule {
@@ -47,7 +51,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
 			'title'    => 'Admin Hide Page Tree by Role',
 			'summary'  => 'Hides the page tree from users who have certain role(s).',
 			'author'   => 'kixe',
-			'version'  => 111,
+			'version'  => 112,
 			'href'     => 'https://processwire.com/talk/topic/6142-hide-page-tree-in-the-admin/#entry60087',
 			'singular' => true,
 			'autoload' => true,
@@ -190,6 +194,16 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
             exit(0);
         }
 
+        // allow to handle action link button clicks (ajax requests) called from ProcessPageLister
+        // validation of token is handled in ProcessPageList::ajaxAction()
+        if ($event->object->process == 'ProcessPageList' &&
+            $event->object->id == 3 &&
+            wire('config')->ajax &&
+            wire('input')->post->action &&
+            wire('input')->post->ProcessPageLister) {
+                return; 
+        }
+
         // disallow pages 3=/page/, 21=/module/, 22=/setup/, 28=/access/
         if (in_array($event->object->id, array(3, 21, 22, 28))) {
             $event->return = false;
@@ -204,6 +218,7 @@ class AdminHidePageTreeByRole extends Process implements Module, ConfigurableMod
             // $event->return = false;
             return;
         }
+
 
         // allow edit for pages living under a specified tree, allow page add under a specified parent
         // excepted from restriction by role ($this->editablePage
